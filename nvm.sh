@@ -22,11 +22,22 @@ nvm_stdout_is_terminal() {
 }
 
 nvm_echo() {
-  command printf %s\\n "$*" 2>/dev/null
+  # in zsh, `command printf` skips the builtin and runs `/usr/bin/printf`
+  if [ -n "${ZSH_VERSION-}" ]; then
+    # shellcheck disable=SC3044
+    builtin printf %s\\n "$*" 2>/dev/null
+  else
+    command printf %s\\n "$*" 2>/dev/null
+  fi
 }
 
 nvm_echo_with_colors() {
-  command printf %b\\n "$*" 2>/dev/null
+  if [ -n "${ZSH_VERSION-}" ]; then
+    # shellcheck disable=SC3044
+    builtin printf %b\\n "$*" 2>/dev/null
+  else
+    command printf %b\\n "$*" 2>/dev/null
+  fi
 }
 
 nvm_cd() {
@@ -212,10 +223,43 @@ nvm_has_system_iojs() {
   [ "$(nvm deactivate >/dev/null 2>&1 && command -v iojs)" != '' ]
 }
 
+nvm_is_installed_exact_version() {
+  case "${1-}" in
+    v*) ;;
+    *) return 1 ;;
+  esac
+  case "${1#v}" in
+    *[!0-9.]* | .* | *. | *..* | *.*.*.*) return 1 ;;
+    *.*.*) ;;
+    *) return 1 ;;
+  esac
+  # an alias with this exact name takes precedence, as it does in `nvm_version`
+  if [ -e "$(nvm_alias_path)/${1}" ]; then
+    return 1
+  fi
+  nvm_is_version_installed "${1}"
+}
+
 nvm_is_version_installed() {
   if [ -z "${1-}" ]; then
     return 1
   fi
+
+  # Fast path: versions in the modern layout live at a directly-computable
+  # path. Checking it first avoids forking `nvm_version_path` (and the `awk`
+  # version comparison inside it) and `nvm_get_os` on shell startup. Versions
+  # below `v0.12` are skipped, since they must not count from the modern
+  # layout; those, io.js, and Windows binaries fall through to the full lookup
+  # below, which also rejects path traversal.
+  case "/${1}/" in
+    */../* | /v0.[0-9].* | /v0.1[01].* | /0.[0-9].* | /0.1[01].*) ;;
+    *)
+      if [ -x "${NVM_DIR}/versions/node/${1}/bin/node" ]; then
+        return 0
+      fi
+    ;;
+  esac
+
   local NVM_NODE_BINARY
   NVM_NODE_BINARY='node'
   if [ "_$(nvm_get_os)" = '_win' ]; then
@@ -552,9 +596,8 @@ else
 fi
 unset NVM_SCRIPT_SOURCE 2>/dev/null
 
-# Performs pure in-memory POSIX path containment checking without subshell process forks.
-# Uses case-guarded ${pathdir%/*} for parent-walk and exact string equality (=) to ensure literal matching
-# for directory names containing glob metacharacters (*, ?, []) across all shells including zsh.
+# Walks parent paths without subshells, comparing names literally before checking
+# filesystem identity to account for case-insensitive paths and directory symlinks.
 nvm_tree_contains_path() {
   local tree
   tree="${1-}"
@@ -577,12 +620,11 @@ nvm_tree_contains_path() {
     clean_tree='/'
   fi
 
-  # Pure in-memory POSIX parent-walk using parameter expansion instead of subshell dirname forks.
-  # Uses literal string equality [ "${pathdir}" = "${clean_tree}" ] to prevent glob expansion bugs.
+  # Keep literal matching for paths that do not exist, including glob characters.
   local pathdir
   pathdir="${node_path}"
   while [ "${pathdir}" != '' ] && [ "${pathdir}" != '.' ] && [ "${pathdir}" != '/' ] &&
-      [ "${pathdir}" != "${clean_tree}" ]; do
+      [ "${pathdir}" != "${clean_tree}" ] && ! [ "${pathdir}" -ef "${clean_tree}" ]; do
     case "${pathdir}" in
       */*)
         pathdir="${pathdir%/*}"
@@ -595,7 +637,7 @@ nvm_tree_contains_path() {
         ;;
     esac
   done
-  [ "${pathdir}" = "${clean_tree}" ]
+  [ "${pathdir}" = "${clean_tree}" ] || [ "${pathdir}" -ef "${clean_tree}" ]
 }
 
 nvm_find_project_dir() {
@@ -754,33 +796,81 @@ nvm_curl_version() {
   command curl -V | command awk '{ if ($1 == "curl") print $2 }' | command sed 's/-.*$//g'
 }
 
+# Try to do some shell magic to do semver greater-than maths.
+# Fall through to the expensive test by calling `awk` if we can't be sure.
 nvm_version_greater() {
-  command awk 'BEGIN {
+  local NVM_LEFT
+  NVM_LEFT="${1#v}"
+  local NVM_RIGHT
+  NVM_RIGHT="${2#v}"
+  local NVM_PLAIN
+  # a third, more complex, argument of `1` (a flag) compares equal versions as true; `0` or
+  # no argument compares them as false.
+  local NVM_OR_EQUAL
+  NVM_OR_EQUAL="${3:-0}"
+  NVM_PLAIN='true'
+
+  # `x.y.z` operands are compared in shell arithmetic, which avoids a fork,
+  # except when a group is long enough to overflow it; anything else - partial
+  # versions, prereleases, and malformed operands - keeps the comparison this
+  # function has always made
+  case "${NVM_LEFT}" in
+    '' | *[!0-9.]* | *..* | .* | *. | *.*.*.*) NVM_PLAIN='false' ;;
+    *.*.*) ;;
+    *) NVM_PLAIN='false' ;;
+  esac
+  case "${NVM_RIGHT}" in
+    '' | *[!0-9.]* | *..* | .* | *. | *.*.*.*) NVM_PLAIN='false' ;;
+    *.*.*) ;;
+    *) NVM_PLAIN='false' ;;
+  esac
+
+  if [ "${NVM_PLAIN}" = 'true' ] && [ "${#NVM_LEFT}" -lt 19 ] && [ "${#NVM_RIGHT}" -lt 19 ]; then
+    local NVM_GROUP
+    local NVM_LEFT_GROUP
+    local NVM_RIGHT_GROUP
+    NVM_GROUP=1
+    while [ "${NVM_GROUP}" -le 3 ]; do
+      NVM_LEFT_GROUP="${NVM_LEFT%%.*}"
+      NVM_LEFT="${NVM_LEFT#*.}"
+      NVM_RIGHT_GROUP="${NVM_RIGHT%%.*}"
+      NVM_RIGHT="${NVM_RIGHT#*.}"
+      if [ "${NVM_LEFT_GROUP}" -lt "${NVM_RIGHT_GROUP}" ]; then
+        return 1
+      elif [ "${NVM_LEFT_GROUP}" -gt "${NVM_RIGHT_GROUP}" ]; then
+        return 0
+      fi
+      NVM_GROUP=$((NVM_GROUP + 1))
+    done
+    if [ "${NVM_OR_EQUAL}" = 1 ]; then
+      return 0
+    fi
+    return 1
+  fi
+  command awk -v or_equal="${NVM_OR_EQUAL}" 'BEGIN {
     if (ARGV[1] == "" || ARGV[2] == "") exit(1)
     split(ARGV[1], a, /\./);
     split(ARGV[2], b, /\./);
     for (i=1; i<=3; i++) {
       if (a[i] && a[i] !~ /^[0-9]+$/) exit(2);
-      if (b[i] && b[i] !~ /^[0-9]+$/) { exit(0); }
+      if (b[i] && b[i] !~ /^[0-9]+$/) {
+        # a non-numeric right-hand group (a prerelease): the left is greater,
+        # unless equality counts, in which case the comparison below decides
+        if (or_equal != 1) { exit(0); }
+      }
       if (a[i] < b[i]) exit(3);
       else if (a[i] > b[i]) exit(0);
     }
+    if (or_equal == 1) { exit(0); }
     exit(4)
-  }' "${1#v}" "${2#v}"
+  }' "${NVM_LEFT}" "${NVM_RIGHT}"
 }
 
+# Try to do some shell magic to do semver greater-than or equal-to maths.
+# Fall through to the expensive test by calling `awk` if we can't be sure.
+# see `nvm_version_greater`
 nvm_version_greater_than_or_equal_to() {
-  command awk 'BEGIN {
-    if (ARGV[1] == "" || ARGV[2] == "") exit(1)
-    split(ARGV[1], a, /\./);
-    split(ARGV[2], b, /\./);
-    for (i=1; i<=3; i++) {
-      if (a[i] && a[i] !~ /^[0-9]+$/) exit(2);
-      if (a[i] < b[i]) exit(3);
-      else if (a[i] > b[i]) exit(0);
-    }
-    exit(0)
-  }' "${1#v}" "${2#v}"
+  nvm_version_greater "${1-}" "${2-}" 1
 }
 
 nvm_version_dir() {
@@ -882,6 +972,16 @@ nvm_version() {
       PATTERN="stable"
     ;;
   esac
+
+  # Fast path: an exact, fully-qualified version that is installed resolves to
+  # itself, unless an alias of the same name takes precedence. Short-circuiting
+  # it here avoids the `nvm_ls` subprocess pipeline on shell startup; every
+  # other pattern falls through to `nvm_ls` unchanged.
+  if nvm_is_installed_exact_version "${PATTERN}"; then
+    nvm_echo "${PATTERN}"
+    return 0
+  fi
+
   VERSION="$(nvm_ls "${PATTERN}" | command tail -1)"
   case "${VERSION}" in
     system[[:blank:]]*)
@@ -1009,17 +1109,14 @@ ${NVM_LS_REMOTE_POST_MERGED_OUTPUT}" | nvm_grep -v "N/A" | command sed '/^ *$/d'
 }
 
 nvm_is_valid_version() {
-  if nvm_validate_implicit_alias "${1-}" 2>/dev/null; then
-    return 0
-  fi
   case "${1-}" in
-    "$(nvm_iojs_prefix)" | \
-    "$(nvm_node_prefix)")
+    "stable" | "unstable" | "iojs" | "node")
       return 0
     ;;
     *)
       local VERSION
-      VERSION="$(nvm_strip_iojs_prefix "${1-}")"
+      VERSION="${1-}"
+      VERSION="${VERSION#iojs-}"
       local NVM_VERSION_CORE
       NVM_VERSION_CORE="${VERSION#v}"
       case "${NVM_VERSION_CORE}" in
@@ -1033,6 +1130,9 @@ nvm_is_valid_version() {
             *.*.*) ;;
             *) return 1 ;;
           esac
+          # a prerelease's `-` makes it unreachable for the pure-shell checks
+          # below, so do the full check now.
+          nvm_version_greater_than_or_equal_to "${VERSION}" 0 || return 1
         ;;
         *.)
           NVM_VERSION_CORE="${NVM_VERSION_CORE%.}"
@@ -1041,7 +1141,7 @@ nvm_is_valid_version() {
       case "${NVM_VERSION_CORE}" in
         '' | .* | *. | *..* | *.*.*.* | *[!0-9.]*) return 1 ;;
       esac
-      nvm_version_greater_than_or_equal_to "${VERSION}" 0
+      # every version that reaches this point is a number, and so `>= 0`
     ;;
   esac
 }
@@ -1154,24 +1254,33 @@ nvm_change_path() {
   # if there’s no initial path, just return the supplementary path
   if [ -z "${1-}" ]; then
     nvm_echo "${3-}${2-}"
+    return
+  fi
+  # `${NVM_DIR}` is matched literally, so escape characters that are special in regexes
+  local NVM_DIR_RE
+  NVM_DIR_RE="$(nvm_echo "${NVM_DIR}" | command sed 's/[][\.*^$+?(){}|]/\\&/g')"
   # if the initial path doesn’t contain an nvm path, prepend the supplementary
   # path
-  elif ! nvm_echo "${1-}" | nvm_grep -q "${NVM_DIR}/[^/]*${2-}" \
-    && ! nvm_echo "${1-}" | nvm_grep -q "${NVM_DIR}/versions/[^/]*/[^/]*${2-}"; then
+  if ! nvm_echo "${1-}" | nvm_grep -Eq "${NVM_DIR_RE}/[^/]*${2-}" \
+    && ! nvm_echo "${1-}" | nvm_grep -Eq "${NVM_DIR_RE}/versions/[^/]*/[^/]*${2-}"; then
     nvm_echo "${3-}${2-}:${1-}"
   # if the initial path contains BOTH an nvm path (checked for above) and
   # that nvm path is preceded by a system binary path, just prepend the
   # supplementary path instead of replacing it.
   # https://github.com/nvm-sh/nvm/issues/1652#issuecomment-342571223
-  elif nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR}/[^/]*${2-}" \
-    || nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR}/versions/[^/]*/[^/]*${2-}"; then
+  elif nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR_RE}/[^/]*${2-}" \
+    || nvm_echo "${1-}" | nvm_grep -Eq "(^|:)(/usr(/local)?)?${2-}:.*${NVM_DIR_RE}/versions/[^/]*/[^/]*${2-}"; then
     nvm_echo "${3-}${2-}:${1-}"
   # use sed to replace the existing nvm path with the supplementary path. This
   # preserves the order of the path.
   else
-    nvm_echo "${1-}" | command sed \
-      -e "s#${NVM_DIR}/[^/]*${2-}[^:]*#${3-}${2-}#" \
-      -e "s#${NVM_DIR}/versions/[^/]*/[^/]*${2-}[^:]*#${3-}${2-}#"
+    local NVM_DIR_SED
+    NVM_DIR_SED="$(nvm_echo "${NVM_DIR_RE}" | command sed 's/#/\\#/g')"
+    local NEW_DIR_SED
+    NEW_DIR_SED="$(nvm_echo "${3-}" | command sed 's/[\&#]/\\&/g')"
+    nvm_echo "${1-}" | command sed -E \
+      -e "s#${NVM_DIR_SED}/[^/]*${2-}[^:]*#${NEW_DIR_SED}${2-}#" \
+      -e "s#${NVM_DIR_SED}/versions/[^/]*/[^/]*${2-}[^:]*#${NEW_DIR_SED}${2-}#"
   fi
 }
 
@@ -1463,8 +1572,9 @@ nvm_list_aliases() {
   nvm_is_zsh && setopt local_options nonomatch
   (
     local ALIAS_PATH
+    # background jobs are explicit subshells: bash 3.2 otherwise drops output from nested `command` calls in them
     for ALIAS_PATH in "${NVM_ALIAS_DIR}/${ALIAS}"*; do
-      NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_HAS_COLORS="${NVM_HAS_COLORS}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}" &
+      (NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_HAS_COLORS="${NVM_HAS_COLORS}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}") &
     done
     wait
   ) | command sort
@@ -1472,12 +1582,12 @@ nvm_list_aliases() {
   (
     local ALIAS_NAME
     for ALIAS_NAME in "$(nvm_node_prefix)" "stable" "unstable" "$(nvm_iojs_prefix)"; do
-      {
+      (
         # shellcheck disable=SC2030,SC2031 # (https://github.com/koalaman/shellcheck/issues/2217)
         if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && { [ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]; }; then
           NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_HAS_COLORS="${NVM_HAS_COLORS}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_default_alias "${ALIAS_NAME}"
         fi
-      } &
+      ) &
     done
     wait
   ) | command sort
@@ -1486,12 +1596,12 @@ nvm_list_aliases() {
     local LTS_ALIAS
     # shellcheck disable=SC2030,SC2031 # (https://github.com/koalaman/shellcheck/issues/2217)
     for ALIAS_PATH in "${NVM_ALIAS_DIR}/lts/${ALIAS}"*; do
-      {
+      (
         LTS_ALIAS="$(NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_HAS_COLORS="${NVM_HAS_COLORS}" NVM_LTS=true nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}")"
         if [ -n "${LTS_ALIAS}" ]; then
           nvm_echo "${LTS_ALIAS}"
         fi
-      } &
+      ) &
     done
     wait
   ) | command sort
@@ -1657,11 +1767,18 @@ nvm_resolve_local_alias() {
   if [ -z "${VERSION}" ]; then
     return $EXIT_CODE
   fi
-  if [ "_${VERSION}" != '_∞' ]; then
-    nvm_version "${VERSION}"
-  else
+  if [ "_${VERSION}" = '_∞' ]; then
     nvm_echo "${VERSION}"
+    return
   fi
+
+  # Fast path: an exact, installed vX.Y.Z needs no further resolution.
+  if nvm_is_installed_exact_version "${VERSION}"; then
+    nvm_echo "${VERSION}"
+    return
+  fi
+
+  nvm_version "${VERSION}"
 }
 
 nvm_iojs_prefix() {
@@ -1681,12 +1798,9 @@ nvm_add_iojs_prefix() {
 }
 
 nvm_strip_iojs_prefix() {
-  local NVM_IOJS_PREFIX
-  NVM_IOJS_PREFIX="$(nvm_iojs_prefix)"
-
   case "${1-}" in
-    "${NVM_IOJS_PREFIX}") nvm_echo ;;
-    *) nvm_echo "${1#"${NVM_IOJS_PREFIX}"-}" ;;
+    "iojs") nvm_echo ;;
+    *) nvm_echo "${1#iojs-}" ;;
   esac
 }
 
@@ -2410,17 +2524,12 @@ BEGIN {
 }
 
 nvm_validate_implicit_alias() {
-  local NVM_IOJS_PREFIX
-  NVM_IOJS_PREFIX="$(nvm_iojs_prefix)"
-  local NVM_NODE_PREFIX
-  NVM_NODE_PREFIX="$(nvm_node_prefix)"
-
   case "$1" in
-    "stable" | "unstable" | "${NVM_IOJS_PREFIX}" | "${NVM_NODE_PREFIX}")
+    "stable" | "unstable" | "iojs" | "node")
       return
     ;;
     *)
-      nvm_err "Only implicit aliases 'stable', 'unstable', '${NVM_IOJS_PREFIX}', and '${NVM_NODE_PREFIX}' are supported."
+      nvm_err "Only implicit aliases 'stable', 'unstable', 'iojs', and 'node' are supported."
       return 1
     ;;
   esac
@@ -2514,18 +2623,74 @@ nvm_print_implicit_alias() {
 }
 
 nvm_get_os() {
-  local NVM_UNAME
-  NVM_UNAME="$(command uname -a)"
+  # dash's `local` keeps the caller's value, so these must start empty
   local NVM_OS
-  case "${NVM_UNAME}" in
-    Linux\ *) NVM_OS=linux ;;
-    Darwin\ *) NVM_OS=darwin ;;
-    SunOS\ *) NVM_OS=sunos ;;
-    FreeBSD\ *) NVM_OS=freebsd ;;
-    OpenBSD\ *) NVM_OS=openbsd ;;
-    AIX\ *) NVM_OS=aix ;;
-    CYGWIN* | MSYS* | MINGW*) NVM_OS=win ;;
-  esac
+  NVM_OS=''
+  local NVM_UNAME
+  local NVM_OS_RELEASE_PATH
+  local NVM_OS_RELEASE_LINE
+  local NVM_OS_RELEASE_ID
+  NVM_OS_RELEASE_ID=''
+  local NVM_OS_KERNEL_PATH
+  local NVM_OS_KERNEL_TYPE
+  NVM_OS_KERNEL_TYPE=''
+
+  # `/etc/os-release` is available on Linux, FreeBSD 13.2+, and the MSYS2 and
+  # Cygwin runtimes; where it is readable, its `ID` names the OS without
+  # spawning `uname`. The file is read, not sourced, so nothing in it runs.
+  # systems without the file (macOS, OpenBSD, ...) and files without an `ID`
+  # fall through to `uname -a` below.
+  NVM_OS_RELEASE_PATH="${NVM_OS_RELEASE:-/etc/os-release}"
+  if [ -r "${NVM_OS_RELEASE_PATH}" ]; then
+    while IFS= read -r NVM_OS_RELEASE_LINE || [ -n "${NVM_OS_RELEASE_LINE}" ]; do
+      case "${NVM_OS_RELEASE_LINE}" in
+        ID=*)
+          NVM_OS_RELEASE_ID="${NVM_OS_RELEASE_LINE#ID=}"
+          break
+        ;;
+      esac
+    done < "${NVM_OS_RELEASE_PATH}"
+    # an `ID` is a single word, which may be quoted and followed by
+    # whitespace (including a CR) or a comment
+    NVM_OS_RELEASE_ID="${NVM_OS_RELEASE_ID%%[[:space:]#]*}"
+    NVM_OS_RELEASE_ID="${NVM_OS_RELEASE_ID#[\"\']}"
+    NVM_OS_RELEASE_ID="${NVM_OS_RELEASE_ID%[\"\']}"
+    case "${NVM_OS_RELEASE_ID}" in
+      freebsd) NVM_OS=freebsd ;;
+      cygwin* | mingw* | msys*) NVM_OS=win ;;
+      # illumos distributions and Oracle Solaris report `SunOS` from
+      # `uname -a`, and GhostBSD reports `FreeBSD`; map these directly instead
+      # of forking `uname`
+      solaris | omnios | openindiana | smartos | illumos) NVM_OS=sunos ;;
+      ghostbsd) NVM_OS=freebsd ;;
+      # no `ID`, or one with no `nvm` OS of its own (DragonFly BSD): let
+      # `uname -a` decide
+      '' | dragonfly) NVM_OS='' ;;
+      # any other `ID` is a Linux distribution's only if the kernel says so;
+      # unlisted BSD and illumos derivatives (e.g. HardenedBSD, Helios) let
+      # `uname -a` decide
+      *)
+        NVM_OS_KERNEL_PATH="${NVM_OS_KERNEL_OSTYPE:-/proc/sys/kernel/ostype}"
+        if [ -r "${NVM_OS_KERNEL_PATH}" ] && IFS= read -r NVM_OS_KERNEL_TYPE < "${NVM_OS_KERNEL_PATH}" && [ "${NVM_OS_KERNEL_TYPE}" = 'Linux' ]; then
+          NVM_OS=linux
+        fi
+      ;;
+    esac
+  fi
+
+  if [ -z "${NVM_OS-}" ]; then
+    NVM_UNAME="$(command uname -a)"
+    case "${NVM_UNAME}" in
+      Linux\ *) NVM_OS=linux ;;
+      Darwin\ *) NVM_OS=darwin ;;
+      SunOS\ *) NVM_OS=sunos ;;
+      FreeBSD\ *) NVM_OS=freebsd ;;
+      OpenBSD\ *) NVM_OS=openbsd ;;
+      AIX\ *) NVM_OS=aix ;;
+      CYGWIN* | MSYS* | MINGW*) NVM_OS=win ;;
+    esac
+  fi
+
   nvm_echo "${NVM_OS-}"
 }
 
@@ -2775,8 +2940,12 @@ nvm_install_binary() {
     return 2
   fi
 
+  # dash's `local` keeps the caller's value, and TMPDIR is usually set: it is
+  # later removed with `rm -rf`, so it must not start as the system temp dir
   local TARBALL
+  TARBALL=''
   local TMPDIR
+  TMPDIR=''
 
   local PROGRESS_BAR
   local NODE_OR_IOJS
@@ -3176,9 +3345,13 @@ nvm_install_source() {
     fi
   fi
 
+  # see nvm_install_binary: these must not inherit TMPDIR, which is removed on failure
   local TARBALL
+  TARBALL=''
   local TMPDIR
+  TMPDIR=''
   local VERSION_PATH
+  VERSION_PATH=''
 
   if [ "${NVM_NO_PROGRESS-}" = "1" ]; then
     # --silent, --show-error, use short option as @samrocketman mentions the compatibility issue.
@@ -3272,9 +3445,28 @@ nvm_npm_global_modules() {
 
 nvm_npmrc_bad_news_bears() {
   local NVM_NPMRC
+  local NVM_NPMRC_LINE
+  local NVM_NPMRC_KEY
   NVM_NPMRC="${1-}"
-  if [ -n "${NVM_NPMRC}" ] && [ -f "${NVM_NPMRC}" ] && nvm_grep -Ee '^(prefix|globalconfig) *=' <"${NVM_NPMRC}" >/dev/null; then
-    return 0
+  if [ -n "${NVM_NPMRC}" ] && [ -f "${NVM_NPMRC}" ]; then
+    # this is fork-free on purpose: it runs up to four times on every `nvm use`/`nvm install`
+    # avoid grepping or sub-shells as much as possible here.
+    while IFS= read -r NVM_NPMRC_LINE || [ -n "${NVM_NPMRC_LINE}" ]; do
+      case "${NVM_NPMRC_LINE}" in
+        *=*)
+          NVM_NPMRC_KEY="${NVM_NPMRC_LINE%%=*}"
+        ;;
+        *)
+          continue
+        ;;
+      esac
+      NVM_NPMRC_KEY="${NVM_NPMRC_KEY%"${NVM_NPMRC_KEY##*[! ]}"}"
+      case "${NVM_NPMRC_KEY}" in
+        prefix | globalconfig)
+          return 0
+        ;;
+      esac
+    done < "${NVM_NPMRC}"
   fi
   return 1
 }
@@ -3308,9 +3500,6 @@ nvm_die_on_prefix() {
     return 3
   fi
 
-  local NVM_OS
-  NVM_OS="$(nvm_get_os)"
-
   # npm normalizes NPM_CONFIG_-prefixed env vars
   # https://github.com/npm/npmconf/blob/22827e4038d6eebaafeb5c13ed2b92cf97b8fb82/npmconf.js#L331-L348
   # https://github.com/npm/npm/blob/5e426a78ca02d0044f8dd26e0c5f881217081cbd/lib/config/core.js#L343-L359
@@ -3320,6 +3509,10 @@ nvm_die_on_prefix() {
   local NVM_NPM_CONFIG_x_PREFIX_ENV
   NVM_NPM_CONFIG_x_PREFIX_ENV="$(command awk 'BEGIN { for (name in ENVIRON) if (toupper(name) == "NPM_CONFIG_PREFIX") { print name; break } }')"
   if [ -n "${NVM_NPM_CONFIG_x_PREFIX_ENV-}" ]; then
+    # `$NVM_OS` is only used to translate Windows paths, but detecting the OS
+    # shells out to `uname`, so it is deferred until it is actually needed
+    local NVM_OS
+    NVM_OS="$(nvm_get_os)"
     local NVM_CONFIG_VALUE
     eval "NVM_CONFIG_VALUE=\"\$${NVM_NPM_CONFIG_x_PREFIX_ENV}\""
     if [ -n "${NVM_CONFIG_VALUE-}" ] && [ "_${NVM_OS}" = "_win" ]; then
@@ -3454,14 +3647,29 @@ nvm_has_solaris_binary() {
   fi
 }
 
+# replaces every literal occurrence of $2 in $1 with $3; values go through the
+# environment so awk does not interpret backslash escapes or regex characters
+nvm_replace_literal() {
+  nvm_echo "${1-}" | NVM_FROM="${2-}" NVM_TO="${3-}" command awk '
+  BEGIN { from = ENVIRON["NVM_FROM"]; to = ENVIRON["NVM_TO"]; n = length(from) }
+  {
+    out = ""; s = $0
+    while (n > 0 && (i = index(s, from)) > 0) {
+      out = out substr(s, 1, i - 1) to
+      s = substr(s, i + n)
+    }
+    print out s
+  }'
+}
+
 nvm_sanitize_path() {
   local SANITIZED_PATH
   SANITIZED_PATH="${1-}"
   if [ "_${SANITIZED_PATH}" != "_${NVM_DIR}" ]; then
-    SANITIZED_PATH="$(nvm_echo "${SANITIZED_PATH}" | command sed -e "s#${NVM_DIR}#\${NVM_DIR}#g")"
+    SANITIZED_PATH="$(nvm_replace_literal "${SANITIZED_PATH}" "${NVM_DIR}" '${NVM_DIR}')"
   fi
   if [ "_${SANITIZED_PATH}" != "_${HOME}" ]; then
-    SANITIZED_PATH="$(nvm_echo "${SANITIZED_PATH}" | command sed -e "s#${HOME}#\${HOME}#g")"
+    SANITIZED_PATH="$(nvm_replace_literal "${SANITIZED_PATH}" "${HOME}" '${HOME}')"
   fi
   nvm_echo "${SANITIZED_PATH}"
 }
@@ -3664,14 +3872,18 @@ nvm() {
   if [ "${-#*e}" != "$-" ]; then
     set +e
     local EXIT_CODE
-    IFS="${DEFAULT_IFS}" nvm "$@"
+    local IFS
+    IFS="${DEFAULT_IFS}"
+    nvm "$@"
     EXIT_CODE="$?"
     set -e
     return "$EXIT_CODE"
   elif [ "${-#*a}" != "$-" ]; then
     set +a
     local EXIT_CODE
-    IFS="${DEFAULT_IFS}" nvm "$@"
+    local IFS
+    IFS="${DEFAULT_IFS}"
+    nvm "$@"
     EXIT_CODE="$?"
     set -a
     return "$EXIT_CODE"
@@ -3679,13 +3891,17 @@ nvm() {
     # shellcheck disable=SC3041
     set +E
     local EXIT_CODE
-    IFS="${DEFAULT_IFS}" nvm "$@"
+    local IFS
+    IFS="${DEFAULT_IFS}"
+    nvm "$@"
     EXIT_CODE="$?"
     # shellcheck disable=SC3041
     set -E
     return "$EXIT_CODE"
   elif [ "${IFS}" != "${DEFAULT_IFS}" ]; then
-    IFS="${DEFAULT_IFS}" nvm "$@"
+    local IFS
+    IFS="${DEFAULT_IFS}"
+    nvm "$@"
     return "$?"
   fi
 
@@ -4521,6 +4737,8 @@ nvm() {
       IS_VERSION_FROM_NVMRC=0
       local NVM_WRITE_TO_NVMRC
       NVM_WRITE_TO_NVMRC=0
+      local NVM_USE_EXACT_INSTALLED
+      NVM_USE_EXACT_INSTALLED=0
 
       while [ $# -ne 0 ]; do
         case "$1" in
@@ -4561,6 +4779,9 @@ nvm() {
           nvm_err 'Please see `nvm --help` or https://github.com/nvm-sh/nvm#nvmrc for more information.'
           return 127
         fi
+      elif nvm_is_installed_exact_version "${PROVIDED_VERSION}"; then
+        VERSION="${PROVIDED_VERSION}"
+        NVM_USE_EXACT_INSTALLED=1
       else
         VERSION="$(nvm_match_version "${PROVIDED_VERSION}")"
       fi
@@ -4602,9 +4823,8 @@ nvm() {
           nvm_ensure_version_installed "${PROVIDED_VERSION}" "${IS_VERSION_FROM_NVMRC}"
         fi
         return 3
-      # This nvm_ensure_version_installed call can be a performance bottleneck
-      # on shell startup. Perhaps we can optimize it away or make it faster.
-      elif ! nvm_ensure_version_installed "${VERSION}" "${IS_VERSION_FROM_NVMRC}"; then
+      # an exact, already-installed version needs no further resolution or checks
+      elif [ "${NVM_USE_EXACT_INSTALLED}" -ne 1 ] && ! nvm_ensure_version_installed "${VERSION}" "${IS_VERSION_FROM_NVMRC}"; then
         return $?
       fi
 
@@ -5226,11 +5446,11 @@ nvm() {
         nvm_echo nvm_err nvm_grep nvm_cd \
         nvm_die_on_prefix nvm_get_make_jobs nvm_get_minor_version \
         nvm_has_solaris_binary nvm_is_merged_node_version \
-        nvm_is_natural_num nvm_is_version_installed nvm_validate_install \
+        nvm_is_natural_num nvm_is_installed_exact_version nvm_is_version_installed nvm_validate_install \
         nvm_install_lock_name nvm_acquire_install_lock nvm_release_install_lock \
         nvm_list_aliases nvm_make_alias nvm_print_alias_file nvm_print_alias_path \
         nvm_print_default_alias nvm_print_formatted_alias nvm_resolve_local_alias \
-        nvm_sanitize_path nvm_has_colors nvm_has_italics nvm_process_parameters \
+        nvm_replace_literal nvm_sanitize_path nvm_has_colors nvm_has_italics nvm_process_parameters \
         nvm_node_version_has_solaris_binary nvm_iojs_version_has_solaris_binary \
         nvm_curl_libz_support nvm_command_info nvm_is_zsh nvm_stdout_is_terminal \
         nvm_npmrc_bad_news_bears nvm_sanitize_auth_header \
